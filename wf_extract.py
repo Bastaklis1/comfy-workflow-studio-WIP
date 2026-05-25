@@ -21,7 +21,7 @@ Also captures data that v2 dropped:
   - Muted nodes optionally reportable via --show-muted flag
 
 Usage:
-    python wf_extract_v3.py <folder> [output.txt] [options]
+    python wf_extract.py <folder> [output.txt] [options]
 
 Options:
     --compact       Summary only (models, groups, metadata) — no node details
