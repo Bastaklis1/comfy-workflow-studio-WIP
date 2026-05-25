@@ -21,7 +21,7 @@ Also captures data that v2 dropped:
   - Muted nodes optionally reportable via --show-muted flag
 
 Usage:
-    python wf_extract.py <folder> [output.txt] [options]
+    python wf_extract_v3.py <folder> [output.txt] [options]
 
 Options:
     --compact       Summary only (models, groups, metadata) — no node details
@@ -33,6 +33,23 @@ Options:
 import json, sys, re, os
 from pathlib import Path
 from collections import defaultdict
+
+def is_comfyui_workflow(filepath: Path) -> bool:
+    """Return True for UI-exported ComfyUI workflow JSON files."""
+    try:
+        with open(filepath, encoding='utf-8', errors='replace') as f:
+            raw = f.read(10)
+            if not raw.strip().startswith('{'):
+                return False
+        with open(filepath, encoding='utf-8', errors='replace') as f:
+            data = json.load(f)
+        return (
+            isinstance(data, dict)
+            and isinstance(data.get('nodes'), list)
+            and isinstance(data.get('links'), list)
+        )
+    except Exception:
+        return False
 
 # ── Node types that are pure UI with no extractable data ─────────────────────
 # Note/MarkdownNote handled separately (they have text content worth keeping)
@@ -733,7 +750,7 @@ def main():
 
     target = Path(args.target)
     files  = sorted(target.glob('**/*.json')) if target.is_dir() else [target]
-    files  = [f for f in files if f.stat().st_size > 500]
+    files  = [f for f in files if f.stat().st_size > 500 and is_comfyui_workflow(f)]
 
     print(f'Pass 1/2 — building schema registry from {len(files)} workflows...')
     registry = SchemaRegistry()
@@ -796,39 +813,20 @@ def main():
     for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
         if t.startswith('[SUBGRAPH:'):
             continue
-        sub_c = sg_type_counts.get(t, 0)
-        sub_note = f' [{sub_c} in subgraphs]' if sub_c else ''
-        summary.append(f'  {c:4d}x  {t}{sub_note}')
+        summary.append(f'  {c:4d}x  {t}')
 
     if model_counts:
         summary.append('\nModel files:')
-        # Group by bare filename — merge paths pointing to the same file
-        # Normalise: replace backslashes, strip leading separators
         def norm(p):
             return re.sub(r'[/\\]+', '/', p).strip('/')
-        # bare filename (no directory) -> {full_normed_path: count}
-        by_name = defaultdict(dict)
+        by_name = defaultdict(int)
         for m, c in model_counts.items():
-            normed = norm(m)
-            # basename: last component after final /
-            base = normed.rsplit('/', 1)[-1]
-            by_name[base][normed] = by_name[base].get(normed, 0) + c
+            base = norm(m).rsplit('/', 1)[-1]
+            by_name[base] += c
 
-        for base, paths in sorted(by_name.items(),
-                                   key=lambda x: -sum(x[1].values())):
-            total = sum(paths.values())
+        for base, total in sorted(by_name.items(), key=lambda x: -x[1]):
             cnt = f' ({total}x)' if total > 1 else ''
-            if len(paths) == 1:
-                # Only one path variant — show full path as before
-                full = list(paths.keys())[0]
-                summary.append(f'  {full}{cnt}')
-            else:
-                # Multiple path variants for same filename
-                summary.append(f'  {base}{cnt}')
-                for p, c in sorted(paths.items(), key=lambda x: -x[1]):
-                    # Show the directory prefix only (drop the filename)
-                    prefix = p.rsplit('/', 1)[0] if '/' in p else '(root)'
-                    summary.append(f'    {prefix}/ ({c}x)')
+            summary.append(f'  {base}{cnt}')
 
     if args.unknown and all_unknown_types:
         summary.append(f'\nTypes with positional fallback ({len(all_unknown_types)}):')

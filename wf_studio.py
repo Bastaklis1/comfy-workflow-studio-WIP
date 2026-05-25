@@ -44,6 +44,32 @@ except Exception as e:
     print(f'[warn] Extractor not found or failed to load: {e}')
     print(f'       Expected: {_extractor_path}')
 
+# ── Optional graph preview from comfyui-workflow-finder ──────────────────────
+GraphCanvas = None
+_graph_viewer_available = False
+_graph_viewer_error = ''
+try:
+    import importlib.util as _importlib_util
+    _here = Path(__file__).resolve().parent
+    _root = _here.parent
+    _graph_candidates = [
+        _here / 'workflow_finder.py',
+        _root / 'workflow_finder.py',
+        _root / 'workflow_finder_main' / 'comfyui-workflow-finder' / 'workflow_finder.py',
+        _root / 'comfyui-workflow-finder-main' / 'workflow_finder.py',
+    ]
+    for _graph_path in _graph_candidates:
+        if not _graph_path.exists():
+            continue
+        _spec = _importlib_util.spec_from_file_location('workflow_finder_graph', _graph_path)
+        _graph_mod = _importlib_util.module_from_spec(_spec)
+        _spec.loader.exec_module(_graph_mod)
+        GraphCanvas = _graph_mod.GraphCanvas
+        _graph_viewer_available = True
+        break
+except Exception as e:
+    _graph_viewer_error = str(e)
+
 # ── Optional LLM backends ─────────────────────────────────────────────────────
 try:
     import urllib.request
@@ -193,58 +219,201 @@ def tag_workflow(node_types: set) -> list[str]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# DEDUPLICATION — deterministic fingerprinting
+# DEDUPLICATION — deterministic graph-aware fingerprinting
 # ═════════════════════════════════════════════════════════════════════════════
 
-def fingerprint(node_types: list) -> str:
-    """Stable hash of sorted unique node types, excluding UI/routing noise."""
-    ignore = SKIP_TYPES | REROUTE_TYPES | {
-        'Note', 'MarkdownNote', 'NoteNode', 'Display Any (rgthree)',
-        'GetNode', 'SetNode', 'easy getNode', 'easy setNode',
-        'Any Switch (rgthree)', 'Fast Muter (rgthree)', 'Fast Bypasser (rgthree)',
-        'Mute / Bypass Repeater (rgthree)', 'Seed (rgthree)',
-        'SaveImage', 'PreviewImage',
+DEDUPE_IGNORE_TYPES = SKIP_TYPES | REROUTE_TYPES | {
+    'Note', 'MarkdownNote', 'NoteNode', 'Display Any (rgthree)',
+    'GetNode', 'SetNode', 'easy getNode', 'easy setNode',
+    'Any Switch (rgthree)', 'Fast Muter (rgthree)', 'Fast Bypasser (rgthree)',
+    'Mute / Bypass Repeater (rgthree)', 'Seed (rgthree)',
+    'SaveImage', 'PreviewImage',
+}
+
+def _stable_hash(value) -> str:
+    raw = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+    return hashlib.md5(raw.encode('utf-8')).hexdigest()
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _model_basenames(models: list) -> list[str]:
+    out = []
+    for m in models or []:
+        norm = re.sub(r'[/\\]+', '/', str(m)).strip('/')
+        base = norm.rsplit('/', 1)[-1] if norm else ''
+        if base:
+            out.append(base.lower())
+    return sorted(out)
+
+def _counter_jaccard(a: dict, b: dict) -> float:
+    if not a or not b:
+        return 0.0
+    keys = set(a) | set(b)
+    inter = sum(min(a.get(k, 0), b.get(k, 0)) for k in keys)
+    union = sum(max(a.get(k, 0), b.get(k, 0)) for k in keys)
+    return inter / union if union else 0.0
+
+def _dedupe_profile(rec: dict) -> dict:
+    """Build cached signatures for duplicate and near-duplicate review."""
+    cached = rec.get('_dedupe_profile')
+    if cached:
+        return cached
+
+    wf_data = rec.get('wf_data', {}) or {}
+    type_counts = defaultdict(int)
+    degree_counts = defaultdict(int)
+    edge_counts = defaultdict(int)
+
+    for nd in wf_data.get('nodes', []):
+        ntype = nd.get('type', '?')
+        if ntype in DEDUPE_IGNORE_TYPES or ntype.startswith('[SUBGRAPH:'):
+            continue
+        type_counts[ntype] += 1
+        in_deg = len(nd.get('in', []) or [])
+        out_deg = len(nd.get('out', []) or [])
+        degree_counts[(ntype, in_deg, out_deg)] += 1
+        for conn in nd.get('out', []) or []:
+            to_type = conn.get('to_type') or '?'
+            if to_type in DEDUPE_IGNORE_TYPES or str(to_type).startswith('[SUBGRAPH:'):
+                continue
+            data = conn.get('data') or ''
+            if isinstance(data, (list, dict)):
+                data = json.dumps(data, sort_keys=True, ensure_ascii=False)
+            edge_counts[(str(ntype), str(conn.get('name') or ''), str(to_type), str(data))] += 1
+
+    # Inner subgraph nodes are known as counts, even when inner topology is not
+    # available in the flattened GUI record. Include them so subgraph-heavy
+    # workflows do not collapse into only their outer wrapper node.
+    for itype, cnt in (wf_data.get('sg_inner_counts') or {}).items():
+        if itype not in DEDUPE_IGNORE_TYPES:
+            type_counts[itype] += cnt
+
+    model_counts = defaultdict(int)
+    for base in _model_basenames(rec.get('models', [])):
+        model_counts[base] += 1
+
+    type_items = sorted(type_counts.items())
+    degree_items = sorted((f'{t}|{i}|{o}', c) for (t, i, o), c in degree_counts.items())
+    edge_items = sorted((f'{src}|{slot}|{dst}|{data}', c)
+                        for (src, slot, dst, data), c in edge_counts.items())
+    model_items = sorted(model_counts.items())
+
+    profile = {
+        'types': dict(type_counts),
+        'degrees': dict(degree_counts),
+        'edges': dict(edge_counts),
+        'models': dict(model_counts),
+        'meaningful_count': sum(type_counts.values()),
+        'type_hash': _stable_hash(type_items),
+        'degree_hash': _stable_hash(degree_items),
+        'edge_hash': _stable_hash(edge_items),
+        'model_hash': _stable_hash(model_items),
     }
-    meaningful = sorted({t for t in node_types
-                         if t not in ignore and not t.startswith('[SUBGRAPH:')})
-    return hashlib.md5(' '.join(meaningful).encode()).hexdigest()
+    profile['structure_hash'] = _stable_hash([
+        profile['type_hash'],
+        profile['degree_hash'],
+        profile['edge_hash'],
+        profile['model_hash'],
+    ])
+    rec['_dedupe_profile'] = profile
+    return profile
+
+def fingerprint(record_or_node_types) -> str:
+    """Compatibility helper: graph-aware for records, node-set for old callers."""
+    if isinstance(record_or_node_types, dict):
+        return _dedupe_profile(record_or_node_types)['structure_hash']
+    meaningful = sorted({
+        t for t in record_or_node_types
+        if t not in DEDUPE_IGNORE_TYPES and not str(t).startswith('[SUBGRAPH:')
+    })
+    return _stable_hash(meaningful)
 
 def similarity(types_a: set, types_b: set) -> float:
-    """Jaccard similarity between two node type sets."""
+    """Legacy node-toolset Jaccard similarity used as one review signal."""
     if not types_a or not types_b:
         return 0.0
     return len(types_a & types_b) / len(types_a | types_b)
 
+def compare_records(a: dict, b: dict) -> dict:
+    """Return a multi-signal similarity profile for two workflow records."""
+    pa = _dedupe_profile(a)
+    pb = _dedupe_profile(b)
+    if a.get('file_hash') and a.get('file_hash') == b.get('file_hash'):
+        return {
+            'score': 1.0, 'reason': 'exact file',
+            'toolset': 1.0, 'structure': 1.0, 'degree': 1.0, 'models': 1.0,
+        }
+    structure_exact = (
+        pa['structure_hash'] == pb['structure_hash']
+        and pa.get('meaningful_count', 0) >= 4
+        and pb.get('meaningful_count', 0) >= 4
+    )
+    edge = _counter_jaccard(pa['edges'], pb['edges'])
+    degree = _counter_jaccard(pa['degrees'], pb['degrees'])
+    toolset = _counter_jaccard(pa['types'], pb['types'])
+    models = _counter_jaccard(pa['models'], pb['models'])
+    score = (edge * 0.45) + (degree * 0.25) + (toolset * 0.20) + (models * 0.10)
+    if min(pa.get('meaningful_count', 0), pb.get('meaningful_count', 0)) < 4:
+        score = min(score, 0.70)
+    if structure_exact:
+        score = max(score, 0.99)
+    if structure_exact:
+        reason = 'same structure'
+    elif min(pa.get('meaningful_count', 0), pb.get('meaningful_count', 0)) < 4:
+        reason = 'tiny workflow'
+    elif edge >= 0.95 and degree >= 0.90:
+        reason = 'near structure'
+    elif score >= 0.85:
+        reason = 'strong variant'
+    else:
+        reason = 'similar toolbox'
+    return {
+        'score': score, 'reason': reason,
+        'toolset': toolset, 'structure': edge, 'degree': degree, 'models': models,
+    }
+
 def cluster_duplicates(records: list, threshold: float = 0.85) -> dict:
     """
-    Group workflows by similarity.
-    Returns {cluster_id: [record, ...]} where cluster_id is the path of the
-    'primary' workflow (first seen / largest).
-    Exact duplicates (same fingerprint) always cluster together.
+    Group workflows by exact file match, graph-aware structure match, or a
+    combined near-duplicate score. The old node-set score is retained as one
+    signal, but it is no longer the whole decision.
     """
-    # Sort by node count descending so the most complex is the "primary"
+    for rec in records:
+        rec.pop('_dupe_score', None)
+        rec.pop('_dupe_reason', None)
+        rec.pop('_dupe_breakdown', None)
+        rec['fingerprint'] = fingerprint(rec)
+
     sorted_recs = sorted(records, key=lambda r: r['node_count'], reverse=True)
 
     clusters = {}   # primary_path -> [records]
-    assigned = {}   # path -> primary_path
+    assigned = set()
 
     for rec in sorted_recs:
         if rec['path'] in assigned:
             continue
         primary = rec['path']
         clusters[primary] = [rec]
-        assigned[primary] = primary
-        types_a = set(rec['node_types'])
+        assigned.add(primary)
+        rec['_dupe_reason'] = 'primary'
+        rec['_dupe_score'] = 1.0
 
         for other in sorted_recs:
             if other['path'] in assigned:
                 continue
-            types_b = set(other['node_types'])
-            # Exact fingerprint match OR above threshold
-            if (rec['fingerprint'] == other['fingerprint'] or
-                    similarity(types_a, types_b) >= threshold):
+            cmp = compare_records(rec, other)
+            exactish = cmp['reason'] in {'exact file', 'same structure'}
+            if exactish or cmp['score'] >= threshold:
                 clusters[primary].append(other)
-                assigned[other['path']] = primary
+                assigned.add(other['path'])
+                other['_dupe_score'] = cmp['score']
+                other['_dupe_reason'] = cmp['reason']
+                other['_dupe_breakdown'] = cmp
 
     return clusters
 
@@ -445,6 +614,7 @@ class App(tk.Tk):
         self._index:  Optional[WorkflowIndex] = None
         self._records: list[dict] = []    # current full record list
         self._filtered: list[dict] = []   # after filter/search
+        self._selected_tags_filter: set[str] = set()
         self._running = False
 
         self._build_style()
@@ -476,6 +646,9 @@ class App(tk.Tk):
             self._show_muted.set(cfg['show_muted'])
         if cfg.get('include_notes') is not None:
             self._include_notes.set(cfg['include_notes'])
+        if cfg.get('selected_tags_filter'):
+            self._selected_tags_filter = set(cfg.get('selected_tags_filter') or [])
+            self._refresh_tag_filter()
 
     def _on_close(self):
         cfg = {
@@ -487,6 +660,7 @@ class App(tk.Tk):
             'threshold':       self._thresh_var.get(),
             'show_muted':      self._show_muted.get(),
             'include_notes':   self._include_notes.get(),
+            'selected_tags_filter': sorted(self._selected_tags_filter),
         }
         save_config(cfg)
         if self._index:
@@ -699,12 +873,11 @@ class App(tk.Tk):
         self._search_var.trace_add('write', lambda *_: self._apply_filter())
         ttk.Entry(bar, textvariable=self._search_var, width=30).pack(side='left', padx=4)
 
-        ttk.Label(bar, text='Tag:', background=PNL).pack(side='left', padx=(12, 0))
-        self._tag_filter_var = tk.StringVar(value='all')
-        self._tag_combo = ttk.Combobox(bar, textvariable=self._tag_filter_var,
-                                        state='readonly', width=20)
-        self._tag_combo.pack(side='left', padx=4)
-        self._tag_combo.bind('<<ComboboxSelected>>', lambda _: self._apply_filter())
+        self._tag_filter_btn = ttk.Button(bar, text='Tag filter',
+                                          command=self._open_tag_filter_dialog)
+        self._tag_filter_btn.pack(side='left', padx=(12, 4))
+        ttk.Button(bar, text='Clear tags', command=self._clear_tag_filter
+                   ).pack(side='left', padx=4)
 
         self._show_new_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar, text='New/Changed only',
@@ -741,6 +914,61 @@ class App(tk.Tk):
 
         return f
 
+    def _open_tag_filter_dialog(self):
+        all_tags = sorted({t for r in self._records for t in r.get('tags', [])})
+        if not all_tags:
+            messagebox.showinfo('No tags', 'Run tagging first.')
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title('Tag filter')
+        dlg.geometry('320x420')
+        dlg.configure(bg=BG)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text='Workflows must include all selected tags.',
+                  style='Dim.TLabel').pack(anchor='w', padx=12, pady=(12, 6))
+
+        frame = ttk.Frame(dlg)
+        frame.pack(fill='both', expand=True, padx=12, pady=6)
+        lb = tk.Listbox(frame, selectmode='extended', bg=PNL2, fg=FG,
+                        selectbackground=DIM, relief='flat',
+                        font=MONO, exportselection=False)
+        sb = ttk.Scrollbar(frame, orient='vertical', command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+
+        for tag in all_tags:
+            lb.insert('end', tag)
+        for idx, tag in enumerate(all_tags):
+            if tag in self._selected_tags_filter:
+                lb.selection_set(idx)
+
+        def apply():
+            self._selected_tags_filter = {all_tags[i] for i in lb.curselection()}
+            self._refresh_tag_filter()
+            self._apply_filter()
+            dlg.destroy()
+
+        def clear():
+            self._selected_tags_filter = set()
+            self._refresh_tag_filter()
+            self._apply_filter()
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg, style='Panel.TFrame', padding=8)
+        btns.pack(fill='x')
+        ttk.Button(btns, text='Clear', command=clear).pack(side='left')
+        ttk.Button(btns, text='Apply', style='Accent.TButton',
+                   command=apply).pack(side='right')
+
+    def _clear_tag_filter(self):
+        self._selected_tags_filter = set()
+        self._refresh_tag_filter()
+        self._apply_filter()
+
     # ── Tab: Duplicates ──────────────────────────────────────────────────────
 
     def _build_tab_dedup(self, parent):
@@ -776,8 +1004,9 @@ class App(tk.Tk):
         self._dupe_count_lbl.pack(side='right', padx=12)
 
         # Duplicate tree
-        cols = ('Cluster', 'File', 'Path', 'Similarity', 'Node count')
-        self._dupe_tree = self._make_tree(f, cols, widths=(30, 220, 280, 80, 90))
+        cols = ('Cluster', 'File', 'Path', 'Match', 'Score', 'Node count')
+        self._dupe_tree = self._make_tree(
+            f, cols, widths=(55, 220, 280, 115, 70, 90), selectmode='extended')
         self._dupe_tree.grid(row=1, column=0, sticky='nsew')
         sb = ttk.Scrollbar(f, orient='vertical', command=self._dupe_tree.yview)
         self._dupe_tree.configure(yscrollcommand=sb.set)
@@ -878,13 +1107,33 @@ class App(tk.Tk):
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
-    def _make_tree(self, parent, cols, widths=None):
-        t = ttk.Treeview(parent, columns=cols, show='headings', selectmode='browse')
+    def _make_tree(self, parent, cols, widths=None, selectmode='browse'):
+        t = ttk.Treeview(parent, columns=cols, show='headings', selectmode=selectmode)
         for i, col in enumerate(cols):
             w = (widths[i] if widths and i < len(widths) else 150)
-            t.heading(col, text=col, anchor='w')
+            t.heading(col, text=col, anchor='w',
+                      command=lambda c=col, tree=t: self._sort_tree(tree, c, False))
             t.column(col, width=w, anchor='w', stretch=(i == len(cols)-1))
         return t
+
+    def _sort_tree(self, tree, col, reverse):
+        def key_for(iid):
+            val = tree.set(iid, col)
+            if isinstance(val, str):
+                cleaned = val.strip().replace('%', '')
+                if cleaned in {'—', ''}:
+                    return (1, '')
+                try:
+                    return (0, float(cleaned))
+                except ValueError:
+                    return (0, cleaned.lower())
+            return (0, val)
+        rows = [(key_for(iid), iid) for iid in tree.get_children('')]
+        rows.sort(reverse=reverse)
+        for idx, (_, iid) in enumerate(rows):
+            tree.move(iid, '', idx)
+        tree.heading(col, text=col, anchor='w',
+                     command=lambda c=col, tr=tree: self._sort_tree(tr, c, not reverse))
 
     def _log(self, msg: str, level: str = 'info'):
         """Write a timestamped line to the log panel."""
@@ -1066,11 +1315,16 @@ class App(tk.Tk):
                 'models':     wf_data.get('models', []),
                 'groups':     wf_data.get('groups', []),
                 'meta':       wf_data.get('meta', {}),
-                'fingerprint': fingerprint(node_types),
+                'file_hash':  '',
                 'tags':       [],
                 'enrichment': {},
                 'wf_data':    wf_data,
             }
+            try:
+                rec['file_hash'] = _file_sha256(fp)
+            except Exception:
+                rec['file_hash'] = ''
+            rec['fingerprint'] = fingerprint(rec)
 
             # Merge saved index data
             saved = self._index.get(rel) if self._index else {}
@@ -1176,6 +1430,9 @@ class App(tk.Tk):
                     data = json.load(f)
                 for n in data.get('nodes', []):
                     registry.observe(n)
+                for sg in data.get('definitions', {}).get('subgraphs', []):
+                    for n in sg.get('nodes', []):
+                        registry.observe(n)
             except:
                 pass
         registry.finalize()
@@ -1254,7 +1511,7 @@ class App(tk.Tk):
 
     def _apply_filter(self):
         search = self._search_var.get().lower().strip()
-        tag_f  = self._tag_filter_var.get()
+        tag_f  = self._selected_tags_filter
 
         filtered = self._records
         if search:
@@ -1264,8 +1521,11 @@ class App(tk.Tk):
                         any(search in t.lower() for t in r.get('tags', [])) or
                         search in r.get('enrichment', {}).get('summary', '').lower() or
                         search in r.get('enrichment', {}).get('primary_purpose', '').lower()]
-        if tag_f and tag_f != 'all':
-            filtered = [r for r in filtered if tag_f in r.get('tags', [])]
+        if tag_f:
+            filtered = [
+                r for r in filtered
+                if all(t in set(r.get('tags', [])) for t in tag_f)
+            ]
         if self._show_new_only.get():
             filtered = [r for r in filtered
                         if r.get('is_new') or r.get('is_changed')]
@@ -1288,10 +1548,15 @@ class App(tk.Tk):
             ))
 
     def _refresh_tag_filter(self):
-        all_tags = sorted({t for r in self._records for t in r.get('tags', [])})
-        self._tag_combo['values'] = ['all'] + all_tags
-        if not self._tag_filter_var.get():
-            self._tag_filter_var.set('all')
+        if not hasattr(self, '_tag_filter_btn'):
+            return
+        if self._selected_tags_filter:
+            label = ', '.join(sorted(self._selected_tags_filter))
+            if len(label) > 34:
+                label = f'{len(self._selected_tags_filter)} tags selected'
+            self._tag_filter_btn.configure(text=f'Tags: {label}')
+        else:
+            self._tag_filter_btn.configure(text='Tag filter')
 
     def _wf_context_menu(self, event):
         iid = self._wf_tree.identify_row(event.y)
@@ -1310,6 +1575,9 @@ class App(tk.Tk):
                          command=lambda: self._open_folder(full_path))
         menu.add_command(label='Open file in default app',
                          command=lambda: self._open_file(full_path))
+        menu.add_separator()
+        menu.add_command(label='Show graph preview',
+                         command=lambda: self._show_graph(full_path))
         menu.post(event.x_root, event.y_root)
 
     def _on_wf_select(self, _event=None):
@@ -1350,34 +1618,59 @@ class App(tk.Tk):
         self._detail_var.set('  |  '.join(parts))
 
     def _dupe_context_menu(self, event):
-        """Right-click menu on duplicate tree rows."""
+        """Right-click menu on duplicate tree rows, including multi-select."""
         iid = self._dupe_tree.identify_row(event.y)
         if not iid:
             return
-        self._dupe_tree.selection_set(iid)
-        item = self._dupe_tree.item(iid)
-        vals = item.get('values', [])
-        if not vals or len(vals) < 3:
+        if iid not in self._dupe_tree.selection():
+            self._dupe_tree.selection_set(iid)
+
+        selected = []
+        for sid in self._dupe_tree.selection():
+            vals = self._dupe_tree.item(sid).get('values', [])
+            if vals and len(vals) >= 3:
+                selected.append((sid, vals[2]))
+        if not selected:
             return
-        rel_path = vals[2]  # Path column
+
+        rel_path = selected[0][1]
+        full_path = str(self._folder / rel_path) if self._folder else rel_path
+        full_paths = [
+            str(self._folder / rel) if self._folder else rel
+            for _, rel in selected
+        ]
 
         menu = tk.Menu(self, tearoff=False, bg=PNL, fg=FG,
                        activebackground=DIM, activeforeground=FG,
                        font=MONO)
-        full_path = str(self._folder / rel_path) if self._folder else rel_path
-
-        menu.add_command(label='Copy path',
-                         command=lambda: self._copy_to_clipboard(full_path))
-        menu.add_command(label='Copy relative path',
-                         command=lambda: self._copy_to_clipboard(rel_path))
+        if len(selected) == 1:
+            menu.add_command(label='Copy path',
+                             command=lambda: self._copy_to_clipboard(full_path))
+            menu.add_command(label='Copy relative path',
+                             command=lambda: self._copy_to_clipboard(rel_path))
+        else:
+            menu.add_command(label=f'Copy {len(selected)} paths',
+                             command=lambda: self._copy_to_clipboard('\n'.join(full_paths)))
         menu.add_separator()
-        menu.add_command(label='Open containing folder',
-                         command=lambda: self._open_folder(full_path))
-        menu.add_command(label='Open file in default app',
-                         command=lambda: self._open_file(full_path))
+        if len(selected) == 1:
+            menu.add_command(label='Open containing folder',
+                             command=lambda: self._open_folder(full_path))
+            menu.add_command(label='Open file in default app',
+                             command=lambda: self._open_file(full_path))
+            menu.add_command(label='Show graph preview',
+                             command=lambda: self._show_graph(full_path))
+        else:
+            menu.add_command(label='Open selected folders',
+                             command=lambda: self._open_many_folders(full_paths))
+            menu.add_command(label='Open selected files',
+                             command=lambda: self._open_many_files(full_paths))
         menu.add_separator()
-        menu.add_command(label='Compare with primary in text editor',
-                         command=lambda: self._compare_with_primary(iid, full_path))
+        if len(selected) == 1:
+            menu.add_command(label='Compare with primary',
+                             command=lambda: self._compare_with_primary(iid, full_path))
+        if len(selected) == 2:
+            menu.add_command(label='Compare selected pair',
+                             command=lambda: self._compare_side_by_side(full_paths[0], full_paths[1]))
         menu.post(event.x_root, event.y_root)
 
     def _copy_to_clipboard(self, text: str):
@@ -1410,9 +1703,21 @@ class App(tk.Tk):
         except Exception as e:
             self._status(f'Could not open file: {e}', 'error')
 
+    def _open_many_folders(self, paths: list[str]):
+        seen = set()
+        for path in paths:
+            folder = str(Path(path).parent)
+            if folder in seen:
+                continue
+            seen.add(folder)
+            self._open_folder(path)
+
+    def _open_many_files(self, paths: list[str]):
+        for path in paths:
+            self._open_file(path)
+
     def _compare_with_primary(self, iid: str, full_path: str):
-        """Open this file and its cluster primary in a text editor side by side."""
-        import subprocess
+        """Open this workflow and its cluster primary in an in-window summary."""
         item = self._dupe_tree.item(iid)
         vals = item.get('values', [])
         cluster_id = vals[0] if vals else ''
@@ -1429,21 +1734,122 @@ class App(tk.Tk):
             self._status('Could not find primary for this cluster.', 'warn')
             return
 
+        self._compare_side_by_side(primary_path, full_path)
+
+    def _record_for_full_path(self, full_path: str) -> Optional[dict]:
+        if not self._folder:
+            return None
         try:
-            if sys.platform == 'win32':
-                # Try Notepad++ with compare plugin, fall back to separate notepad windows
-                try:
-                    subprocess.Popen([
-                        'notepad++', '-multiInst', '-nosession',
-                        primary_path, full_path
-                    ])
-                except FileNotFoundError:
-                    subprocess.Popen(['notepad', primary_path])
-                    subprocess.Popen(['notepad', full_path])
-            else:
-                subprocess.Popen(['diff', '--color', primary_path, full_path])
+            rel = str(Path(full_path).resolve().relative_to(self._folder.resolve()))
+        except Exception:
+            rel = str(full_path)
+        rel = rel.replace('/', '\\')
+        return next((r for r in self._records if r['path'].replace('/', '\\') == rel), None)
+
+    def _comparison_lines(self, rec: dict) -> list[str]:
+        lines = [
+            rec.get('name', ''),
+            rec.get('path', ''),
+            '',
+            f"Nodes: {rec.get('node_count', 0)}",
+            f"Tags: {', '.join(rec.get('tags', [])) or '—'}",
+        ]
+        enr = rec.get('enrichment') or {}
+        if enr:
+            lines += [
+                f"Purpose: {enr.get('primary_purpose', '—')}",
+                f"Summary: {enr.get('summary', '—')}",
+                f"Notable: {enr.get('notable', '—')}",
+            ]
+        models = _model_basenames(rec.get('models', []))
+        lines += ['', 'Models:']
+        lines += [f'  {m}' for m in models[:80]] or ['  —']
+        if len(models) > 80:
+            lines.append(f'  ... {len(models) - 80} more')
+        counts = defaultdict(int)
+        for nd in (rec.get('wf_data') or {}).get('nodes', []):
+            t = nd.get('type', '?')
+            if t not in DEDUPE_IGNORE_TYPES and not t.startswith('[SUBGRAPH:'):
+                counts[t] += 1
+        for itype, cnt in (rec.get('wf_data') or {}).get('sg_inner_counts', {}).items():
+            if itype not in DEDUPE_IGNORE_TYPES:
+                counts[itype] += cnt
+        lines += ['', 'Meaningful node types:']
+        for t, c in sorted(counts.items(), key=lambda x: (-x[1], x[0].lower()))[:140]:
+            lines.append(f'  {c:3d}x {t}')
+        if len(counts) > 140:
+            lines.append(f'  ... {len(counts) - 140} more')
+        return lines
+
+    def _compare_side_by_side(self, path1: str, path2: str):
+        rec1 = self._record_for_full_path(path1)
+        rec2 = self._record_for_full_path(path2)
+        if not rec1 or not rec2:
+            self._status('Could not find workflow data for comparison.', 'error')
+            return
+        cmp = compare_records(rec1, rec2)
+        win = tk.Toplevel(self)
+        win.title('Workflow comparison')
+        win.geometry('1180x760')
+        win.configure(bg=BG)
+
+        head = ttk.Frame(win, style='Panel.TFrame', padding=8)
+        head.pack(fill='x')
+        ttk.Label(
+            head,
+            text=(f"Match: {cmp['reason']}  |  score {cmp['score']:.0%}  |  "
+                  f"structure {cmp['structure']:.0%}, shape {cmp['degree']:.0%}, "
+                  f"toolset {cmp['toolset']:.0%}, models {cmp['models']:.0%}"),
+            background=PNL, foreground=YEL, font=MONO_B
+        ).pack(side='left')
+
+        body = ttk.Frame(win)
+        body.pack(fill='both', expand=True)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        def make_panel(col, rec, path):
+            frame = ttk.Frame(body, padding=6)
+            frame.grid(row=0, column=col, sticky='nsew')
+            frame.rowconfigure(1, weight=1)
+            frame.columnconfigure(0, weight=1)
+            ttk.Label(frame, text=rec['name'], style='Head.TLabel').grid(row=0, column=0, sticky='w')
+            text = tk.Text(frame, bg=PNL2, fg=FG, insertbackground=FG,
+                           font=MONO_S, wrap='none', relief='flat')
+            ys = ttk.Scrollbar(frame, orient='vertical', command=text.yview)
+            text.configure(yscrollcommand=ys.set)
+            text.grid(row=1, column=0, sticky='nsew')
+            ys.grid(row=1, column=1, sticky='ns')
+            text.insert('end', '\n'.join(self._comparison_lines(rec)))
+            text.configure(state='disabled')
+            btns = ttk.Frame(frame, style='Panel.TFrame', padding=4)
+            btns.grid(row=2, column=0, columnspan=2, sticky='ew')
+            ttk.Button(btns, text='Open folder',
+                       command=lambda: self._open_folder(path)).pack(side='left')
+            ttk.Button(btns, text='Graph',
+                       command=lambda: self._show_graph(path)).pack(side='left', padx=4)
+
+        make_panel(0, rec1, path1)
+        make_panel(1, rec2, path2)
+
+    def _show_graph(self, full_path: str):
+        if not _graph_viewer_available or GraphCanvas is None:
+            msg = 'Graph viewer not available.'
+            if _graph_viewer_error:
+                msg += f' {_graph_viewer_error}'
+            self._status(msg, 'warn')
+            return
+        win = tk.Toplevel(self)
+        win.title(f'Graph preview: {Path(full_path).name}')
+        win.geometry('980x720')
+        win.configure(bg=BG)
+        canvas = GraphCanvas(win)
+        canvas.pack(fill='both', expand=True)
+        try:
+            canvas.load_workflow(full_path)
         except Exception as e:
-            self._status(f'Could not open comparison: {e}', 'error')
+            self._status(f'Could not show graph: {e}', 'error')
 
     def _refresh_dedup_display(self, *_):
         if not self._records:
@@ -1466,18 +1872,19 @@ class App(tk.Tk):
             # Primary row
             self._dupe_tree.insert('', 'end', tags=('primary',), values=(
                 f'#{cluster_id}', primary['name'], primary['path'],
-                'primary', primary['node_count'],
+                'primary', '—', primary['node_count'],
             ))
 
             for dup in dupes:
-                types_p = set(primary['node_types'])
-                types_d = set(dup['node_types'])
-                sim = similarity(types_p, types_d)
-                is_exact = primary['fingerprint'] == dup['fingerprint']
+                cmp = dup.get('_dupe_breakdown') or compare_records(primary, dup)
+                reason = dup.get('_dupe_reason') or cmp['reason']
+                score = dup.get('_dupe_score', cmp['score'])
+                is_exact = reason in {'exact file', 'same structure'}
                 tag = 'exact' if is_exact else 'duplicate'
                 self._dupe_tree.insert('', 'end', tags=(tag,), values=(
                     f'#{cluster_id}', dup['name'], dup['path'],
-                    f'{"EXACT" if is_exact else f"{sim:.0%}"}',
+                    reason,
+                    f'{score:.0%}',
                     dup['node_count'],
                 ))
 
